@@ -215,8 +215,35 @@ function computeFetch(
   repo: Repo,
   args: FetchArgs,
 ): { objects: GitObject[]; shallow: string[]; unshallow: string[] } {
-  const wants = [...new Set(args.wants)].filter((oid) => isOid(oid) && repo.objects.get(oid)?.type === 'commit');
-  const haves = [...new Set(args.haves)].filter((oid) => isOid(oid) && repo.objects.get(oid)?.type === 'commit');
+  // Wants and haves may name tag objects as well as commits: a tag want delivers
+  // the tag object itself plus the commit it peels to; a tag have is held the same way.
+  const tagWants = new Set<string>();
+  const wants: string[] = [];
+  for (const oid of [...new Set(args.wants)]) {
+    if (!isOid(oid)) continue;
+    const object = repo.objects.get(oid);
+    if (object === undefined) continue;
+    if (object.type === 'commit') wants.push(oid);
+    else if (object.type === 'tag') {
+      tagWants.add(oid);
+      const commit = store.peelToCommit(repo, oid);
+      if (commit !== null) wants.push(commit);
+    }
+  }
+  const tagHaves = new Set<string>();
+  const haves: string[] = [];
+  for (const oid of [...new Set(args.haves)]) {
+    if (!isOid(oid)) continue;
+    const object = repo.objects.get(oid);
+    if (object === undefined) continue;
+    if (object.type === 'commit') haves.push(oid);
+    else if (object.type === 'tag') {
+      tagHaves.add(oid);
+      const commit = store.peelToCommit(repo, oid);
+      if (commit !== null) haves.push(commit);
+    }
+  }
+  if (wants.length === 0 && tagWants.size === 0) return { objects: [], shallow: [], unshallow: [] };
   const shallowSet = new Set(args.shallow);
   // What the client already holds: the full history closure of the haves, except a shallow
   // boundary's ancestors are NOT held (a shallow clone holds the boundary, not its history).
@@ -249,6 +276,10 @@ function computeFetch(
     for (const objectOid of store.commitClosure(repo, oid)) {
       if (!held.has(objectOid)) result.add(objectOid);
     }
+  }
+  // Tag objects named in the wants are delivered themselves (unless already held).
+  for (const oid of tagWants) {
+    if (!tagHaves.has(oid)) result.add(oid);
   }
   const objects: GitObject[] = [];
   for (const oid of result) {
@@ -394,6 +425,12 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): Buffer {
     let ok = false;
     if (unpackOk) {
       const current = repo.refs.get(command.ref);
+      // Heads point at commits; tags may point at a commit (lightweight) or a tag object
+      // (annotated). Other refs follow the tag rule.
+      const isHead = command.ref.startsWith('refs/heads/');
+      const object = repo.objects.get(command.newOid);
+      const typeOk =
+        object !== undefined && (isHead ? object.type === 'commit' : object.type === 'commit' || object.type === 'tag');
       if (!command.ref.startsWith('refs/')) {
         ok = false;
       } else if (command.newOid === ZERO_OID) {
@@ -403,23 +440,23 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): Buffer {
           ok = true;
         }
       } else if (command.oldOid === ZERO_OID) {
-        // Create: the ref must not exist, and the new object must be a commit we hold.
-        const object = repo.objects.get(command.newOid);
-        if (current === undefined && object !== undefined && object.type === 'commit') {
+        // Create: the ref must not exist, and the new object must be one we hold.
+        if (current === undefined && typeOk) {
           repo.refs.set(command.ref, command.newOid);
           ok = true;
         }
-      } else {
-        // Update: old must be the current tip and new must descend from old.
-        const object = repo.objects.get(command.newOid);
-        if (current !== undefined && current === command.oldOid && object !== undefined && object.type === 'commit') {
-          if (command.newOid === command.oldOid) ok = true;
-          else {
-            const reachable = store.reachableCommits(repo, [command.newOid]);
-            if (reachable.has(command.oldOid)) {
-              repo.refs.set(command.ref, command.newOid);
-              ok = true;
-            }
+      } else if (current !== undefined && current === command.oldOid && typeOk) {
+        // Update: old must be the current tip. Heads must fast-forward (new descends
+        // from old); tags are replaced, so old == current is enough.
+        if (command.newOid === command.oldOid) ok = true;
+        else if (!isHead) {
+          repo.refs.set(command.ref, command.newOid);
+          ok = true;
+        } else {
+          const reachable = store.reachableCommits(repo, [command.newOid]);
+          if (reachable.has(command.oldOid)) {
+            repo.refs.set(command.ref, command.newOid);
+            ok = true;
           }
         }
       }

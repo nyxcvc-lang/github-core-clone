@@ -271,7 +271,10 @@ export function handleRest(
     const { page, link } = paginate(ctx, path, query, ordered);
     const items = page.map((sha) => {
       const object = repo.objects.get(sha);
-      const message = object !== undefined && object.type === 'commit' ? parseCommit(object.data).message : '';
+      // Commit objects store the message with a trailing newline (git-canonical);
+      // the API returns it exactly as the caller wrote it, without that newline.
+      const raw = object !== undefined && object.type === 'commit' ? parseCommit(object.data).message : '';
+      const message = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
       return { sha, commit: { message } };
     });
     return sendJson(ctx, res, 200, items, linkHeader(link));
