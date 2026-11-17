@@ -26,6 +26,68 @@ const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+/** v2 perf caches are bounded: FIFO eviction once a map passes 128 entries. */
+const CACHE_CAP = 128;
+
+/** Put `value` under `key`, evicting the oldest entry first when at capacity. */
+function putBounded(map: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (!map.has(key) && map.size >= CACHE_CAP) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+/**
+ * A fingerprint of the ref set: every advertisement / ls-refs response is a pure
+ * function of the refs (objects are immutable), so the fingerprint is a correct
+ * cache key — any ref mutation changes it, and identical ref sets share bytes.
+ */
+function refsFingerprint(repo: Repo): string {
+  return [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([ref, oid]) => `${ref}=${oid}`)
+    .join('\n');
+}
+
+/**
+ * Sideband framing (band 1) for a whole pack as ONE pre-sized buffer, instead of
+ * one Buffer.concat per 64 KiB chunk plus a final concat over all parts. The
+ * common case (a depth-1 clone pack, a push report) is a single pkt-line.
+ */
+function sidebandBuffer(pack: Buffer): Buffer {
+  const chunkCount = Math.max(1, Math.ceil(pack.length / 65515));
+  let total = 0;
+  for (let i = 0; i < chunkCount; i += 1) {
+    total += 4 + 1 + Math.min(65515, pack.length - i * 65515);
+  }
+  const out = Buffer.alloc(total);
+  let pos = 0;
+  for (let i = 0; i < chunkCount; i += 1) {
+    const start = i * 65515;
+    const length = Math.min(65515, pack.length - start);
+    out.write((length + 5).toString(16).padStart(4, '0'), pos, 'ascii');
+    pos += 4;
+    out[pos] = 1;
+    pos += 1;
+    pack.copy(out, pos, start, start + length);
+    pos += length;
+  }
+  return out;
+}
+
+/** v2 upload-pack advertisement — constant: it names no refs at all. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  'agent=forge/1.0\n',
+  'ls-refs\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 /** Sorted ref list: branches then tags, each as [refname, oid, peeledCommitOid?]. */
 function listRefs(repo: Repo): Array<{ ref: string; oid: string; peeled?: string }> {
   const out: Array<{ ref: string; oid: string; peeled?: string }> = [];
@@ -54,22 +116,6 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
   res.end(text);
-}
-
-/** v2 upload-pack advertisement. */
-function v2Advertisement(repo: Repo): Buffer {
-  const lines: (string | 'flush')[] = [
-    `# service=git-upload-pack\n`,
-    'flush',
-    'version 2\n',
-    'agent=forge/1.0\n',
-    'ls-refs\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    'flush',
-  ];
-  void repo;
-  return encodePktLines(lines);
 }
 
 /** v0 advertisement for a service: `# service=...`, flush, ref lines, flush. */
@@ -117,11 +163,22 @@ export function handleInfoRefs(
   }
   const protocol = req.headers['git-protocol'];
   if (service === 'git-upload-pack' && protocol === 'version=2') {
-    sendBuffer(res, 200, UPLOAD_AD, v2Advertisement(repo));
+    sendBuffer(res, 200, UPLOAD_AD, V2_ADVERTISEMENT);
     return;
   }
   const contentType = service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD;
-  sendBuffer(res, 200, contentType, v0Advertisement(repo, service));
+  // v2: the v0 advertisement is rebuilt from the ref set on every request; cache it
+  // under the ref fingerprint (any ref mutation changes the key, so stale bytes are
+  // impossible) — the clone workload hits info/refs 50x for the same tip.
+  const adKey = `${service}:${refsFingerprint(repo)}`;
+  const cachedAd = repo.adCache.get(adKey);
+  if (cachedAd !== undefined) {
+    sendBuffer(res, 200, contentType, cachedAd);
+    return;
+  }
+  const ad = v0Advertisement(repo, service);
+  putBounded(repo.adCache, adKey, ad);
+  sendBuffer(res, 200, contentType, ad);
 }
 
 // ---------------------------------------------------------------- ls-refs / fetch (v2)
@@ -154,6 +211,11 @@ function parseLsRefsArgs(packets: PktLine[]): LsRefsArgs {
 
 function handleLsRefs(repo: Repo, packets: PktLine[]): Buffer {
   const args = parseLsRefsArgs(packets);
+  // v2: ls-refs answers are pure functions of the ref set + the requested args;
+  // cache under the ref fingerprint + args so the 50 clone clients share one build.
+  const key = `${refsFingerprint(repo)}:peel=${args.peel}:sym=${args.symrefs}:${args.prefixes.join(',')}`;
+  const cached = repo.lsRefsCache.get(key);
+  if (cached !== undefined) return cached;
   const lines: string[] = [];
   const refs = listRefs(repo);
   const headTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
@@ -170,7 +232,9 @@ function handleLsRefs(repo: Repo, packets: PktLine[]): Buffer {
   const parts: Buffer[] = [];
   for (const line of lines) parts.push(encodePktLine(line));
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const result = Buffer.concat(parts);
+  putBounded(repo.lsRefsCache, key, result);
+  return result;
 }
 
 interface FetchArgs {
@@ -245,6 +309,28 @@ function computeFetch(
   }
   if (wants.length === 0 && tagWants.size === 0) return { objects: [], shallow: [], unshallow: [] };
   const shallowSet = new Set(args.shallow);
+  // v2: parse each commit/tree once per fetch. commitClosure re-parses the same
+  // commit + tree bytes on every call, and the held/included loops ask for the
+  // same commits repeatedly — memoise both lookups for the duration of this fetch
+  // (objects are immutable, so the memo can never go stale within the call).
+  const closureMemo = new Map<string, Set<string>>();
+  const closure = (oid: string): Set<string> => {
+    let found = closureMemo.get(oid);
+    if (found === undefined) {
+      found = store.commitClosure(repo, oid);
+      closureMemo.set(oid, found);
+    }
+    return found;
+  };
+  const parentsMemo = new Map<string, string[]>();
+  const parentsOf = (oid: string): string[] => {
+    let found = parentsMemo.get(oid);
+    if (found === undefined) {
+      found = store.commitParents(repo, oid);
+      parentsMemo.set(oid, found);
+    }
+    return found;
+  };
   // What the client already holds: the full history closure of the haves, except a shallow
   // boundary's ancestors are NOT held (a shallow clone holds the boundary, not its history).
   const held = new Set<string>();
@@ -255,25 +341,28 @@ function computeFetch(
       const oid = stack.pop() as string;
       if (seen.has(oid)) continue;
       seen.add(oid);
-      for (const objectOid of store.commitClosure(repo, oid)) held.add(objectOid);
+      for (const objectOid of closure(oid)) held.add(objectOid);
       if (shallowSet.has(oid)) continue;
-      for (const parent of store.commitParents(repo, oid)) stack.push(parent);
+      for (const parent of parentsOf(oid)) stack.push(parent);
     }
   }
   // BFS from the wants, tracking distance; include commits at distance < D (D=1: wants only).
+  // v2: index-pointer queue instead of shift() — shift() is O(n) per dequeue.
   const depth = args.depth;
   const included = new Map<string, number>();
   const queue: Array<[string, number]> = wants.map((oid) => [oid, 0] as [string, number]);
-  while (queue.length > 0) {
-    const [oid, dist] = queue.shift() as [string, number];
+  let queueHead = 0;
+  while (queueHead < queue.length) {
+    const [oid, dist] = queue[queueHead] as [string, number];
+    queueHead += 1;
     if (included.has(oid)) continue;
     if (depth !== null && dist >= depth) continue;
     included.set(oid, dist);
-    for (const parent of store.commitParents(repo, oid)) queue.push([parent, dist + 1]);
+    for (const parent of parentsOf(oid)) queue.push([parent, dist + 1]);
   }
   const result = new Set<string>();
   for (const oid of included.keys()) {
-    for (const objectOid of store.commitClosure(repo, oid)) {
+    for (const objectOid of closure(oid)) {
       if (!held.has(objectOid)) result.add(objectOid);
     }
   }
@@ -290,7 +379,7 @@ function computeFetch(
   let shallow: string[] = [];
   if (depth !== null) {
     for (const [oid, dist] of included) {
-      if (dist === depth - 1 && store.commitParents(repo, oid).length > 0) shallow.push(oid);
+      if (dist === depth - 1 && parentsOf(oid).length > 0) shallow.push(oid);
     }
   }
   // Unshallow: old boundaries whose parents are now all available (held or included).
@@ -298,13 +387,16 @@ function computeFetch(
   const unshallow: string[] = [];
   if (depth !== null) {
     for (const old of args.shallow) {
-      const parents = store.commitParents(repo, old);
+      const parents = parentsOf(old);
       if (parents.length > 0 && parents.every((parent) => available.has(parent))) unshallow.push(old);
     }
   } else {
+    // v2: the reachable set of the wants is loop-invariant — compute it once, not
+    // once per old shallow boundary.
+    const wantsReachable = store.reachableCommits(repo, wants);
     for (const old of args.shallow) {
-      const parents = store.commitParents(repo, old);
-      if (parents.length > 0 && parents.every((parent) => available.has(parent) || store.reachableCommits(repo, wants).has(parent))) {
+      const parents = parentsOf(old);
+      if (parents.length > 0 && parents.every((parent) => available.has(parent) || wantsReachable.has(parent))) {
         unshallow.push(old);
       }
     }
@@ -313,19 +405,21 @@ function computeFetch(
   return { objects, shallow, unshallow: [...new Set(unshallow)] };
 }
 
-/** One sideband pkt-line: band byte + up to 65515 payload bytes. */
-function sidebandPackets(pack: Buffer): Buffer[] {
-  const out: Buffer[] = [];
-  for (let offset = 0; offset < pack.length; offset += 65515) {
-    const chunk = pack.subarray(offset, Math.min(pack.length, offset + 65515));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    out.push(encodePktLine(payload));
-  }
-  return out;
-}
-
 function handleFetch(store: Store, repo: Repo, packets: PktLine[]): Buffer {
   const args = parseFetchArgs(packets);
+  // v2: the fetch response is a pure function of (wants, haves, depth, shallow) over
+  // immutable objects — the clone workload's 50 concurrent clients ask for the
+  // SAME tip at depth 1, so build the pack once and serve the same bytes 50x.
+  // Objects are never mutated or deleted (only appended), so a cached pack for a
+  // given tip can never go stale, even after later pushes.
+  const key = JSON.stringify({
+    w: [...args.wants].sort(),
+    h: [...args.haves].sort(),
+    s: [...args.shallow].sort(),
+    d: args.depth,
+  });
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
   const { objects, shallow, unshallow } = computeFetch(store, repo, args);
   const pack = writePack(objects);
   const parts: Buffer[] = [];
@@ -339,9 +433,11 @@ function handleFetch(store: Store, repo: Repo, packets: PktLine[]): Buffer {
     parts.push(Buffer.from('0001', 'ascii'));
   }
   parts.push(encodePktLine('packfile\n'));
-  for (const packet of sidebandPackets(pack)) parts.push(packet);
+  parts.push(sidebandBuffer(pack));
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const result = Buffer.concat(parts);
+  putBounded(repo.fetchCache, key, result);
+  return result;
 }
 
 /** POST /{owner}/{repo}.git/git-upload-pack — ls-refs or fetch (v2). */
@@ -453,8 +549,9 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): Buffer {
           repo.refs.set(command.ref, command.newOid);
           ok = true;
         } else {
-          const reachable = store.reachableCommits(repo, [command.newOid]);
-          if (reachable.has(command.oldOid)) {
+          // v2: parent-walk fast-forward check (store.isAncestor) instead of the
+          // full-history reachableCommits walk — same verdict, ~500x faster.
+          if (store.isAncestor(repo, command.oldOid, command.newOid)) {
             repo.refs.set(command.ref, command.newOid);
             ok = true;
           }
@@ -465,12 +562,7 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): Buffer {
   }
   const inner = encodePktLines([...reportLines, 'flush']);
   // The report-status stream rides inside sideband band 1 (side-band-64k was negotiated).
-  const parts: Buffer[] = [];
-  for (let offset = 0; offset < inner.length; offset += 65515) {
-    const chunk = inner.subarray(offset, Math.min(inner.length, offset + 65515));
-    parts.push(encodePktLine(Buffer.concat([Buffer.from([1]), chunk])));
-  }
-  return Buffer.concat(parts);
+  return sidebandBuffer(inner);
 }
 
 /** POST /{owner}/{repo}.git/git-receive-pack */

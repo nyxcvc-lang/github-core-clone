@@ -73,7 +73,9 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
   }
 
   // Git smart HTTP: /{owner}/{repo}.git/info/refs, /git-upload-pack, /git-receive-pack.
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/.exec(pathname);
+  // v2: cheap prefix check first — the git regex only matches paths carrying '.git/',
+  // so REST/GraphQL/MCP traffic skips the regex exec entirely.
+  const gitMatch = pathname.includes('.git/') ? /^\/([^/]+)\/([^/]+)\.git(\/.*)$/.exec(pathname) : null;
   if (gitMatch !== null) {
     const owner = decodeURIComponent(gitMatch[1] as string);
     const repoName = decodeURIComponent(gitMatch[2] as string);

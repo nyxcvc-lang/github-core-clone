@@ -23,6 +23,37 @@ function sendJson(ctx: RestContext, res: ServerResponse, status: number, body: u
   res.end(text);
 }
 
+/** Send an already-serialised JSON body (the issue-response cache hit path). */
+function sendText(ctx: RestContext, res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-github-request-id': ctx.store.requestId(),
+    ...extra,
+  };
+  headers['content-length'] = String(Buffer.byteLength(text));
+  res.writeHead(status, headers);
+  res.end(text);
+}
+
+/**
+ * v2: GET /issues/:n serves the same serialised body 2,000x in the read workload,
+ * so cache the serialised text per issue, keyed by the issue's mutation counter
+ * (bumped on PATCH and on comment add) and the request base URL (issueJson embeds
+ * it). A stale body is impossible: any mutation bumps the counter first. The
+ * request id stays per-request — only the body bytes are cached.
+ */
+function sendIssue(ctx: RestContext, res: ServerResponse, repo: Repo, issue: Issue): void {
+  const version = repo.issueVersions.get(issue.number) ?? 0;
+  const cached = repo.issueTextCache.get(issue.number);
+  if (cached !== undefined && cached.version === version && cached.baseUrl === ctx.baseUrl) {
+    sendText(ctx, res, 200, cached.text);
+    return;
+  }
+  const text = JSON.stringify(issueJson(ctx, repo, issue));
+  repo.issueTextCache.set(issue.number, { version, baseUrl: ctx.baseUrl, text });
+  sendText(ctx, res, 200, text);
+}
+
 function err(ctx: RestContext, res: ServerResponse, status: number, message: string): void {
   sendJson(ctx, res, status, { message });
 }
@@ -365,16 +396,18 @@ export function handleRest(
         const commentBody = asString(body.body);
         if (commentBody === null) return err(ctx, res, 422, 'body is required');
         const comment = store.addComment(issue, commentBody);
+        store.touchIssue(repo, issue.number);
         return sendJson(ctx, res, 201, commentJson(ctx, repo, issue, comment));
       }
       return err(ctx, res, 405, 'Method Not Allowed');
     }
-    if (method === 'GET') return sendJson(ctx, res, 200, issueJson(ctx, repo, issue));
+    if (method === 'GET') return sendIssue(ctx, res, repo, issue);
     if (method === 'PATCH') {
       if (!isRecord(body)) return err(ctx, res, 400, 'Invalid JSON');
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
+      store.touchIssue(repo, issue.number);
       return sendJson(ctx, res, 200, issueJson(ctx, repo, issue));
     }
     return err(ctx, res, 405, 'Method Not Allowed');

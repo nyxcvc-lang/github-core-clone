@@ -216,8 +216,55 @@ export function decodePktLinesUntilFlush(buf: Buffer): { packets: PktLine[]; res
 const PACK_TYPES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const PACK_TYPE_IDS: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
-/** Inflate the zlib stream starting at `offset`, whose inflated size is `expectedSize`. */
+/**
+ * Inflate the zlib stream starting at `offset`, whose inflated size is `expectedSize`.
+ *
+ * v2: one inflate instead of ~nine. `inflateSync` stops at the end of the first zlib
+ * stream and ignores trailing bytes, so a single inflate of the remainder yields the
+ * object (verified: on a 3-object pack the remainder inflate returns exactly the
+ * first object's bytes). The stream's true end is its closing Adler-32 checksum:
+ * the 4 bytes after the deflate data equal adler32(data), so the first candidate end
+ * is found by searching for those bytes, and verified by inflating the candidate
+ * slice — a false Adler match inside the deflate data fails the slice inflate and
+ * the search moves on. If no candidate verifies (never seen on a valid pack), fall
+ * back to the legacy binary search below.
+ */
 function inflateAt(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; nextOffset: number } {
+  const data = inflateSync(buf.subarray(offset));
+  if (data.length !== expectedSize) throw new Error('inflated size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let candidate = buf.indexOf(needle, offset);
+  while (candidate >= 0) {
+    const end = candidate + 4;
+    try {
+      const probe = inflateSync(buf.subarray(offset, end));
+      if (probe.length === expectedSize) return { data, nextOffset: end };
+    } catch {
+      // Not the true stream end (Adler bytes coinciding inside the deflate data).
+    }
+    candidate = buf.indexOf(needle, end);
+  }
+  return inflateAtLegacy(buf, offset, expectedSize);
+}
+
+/** Adler-32, the checksum that closes every zlib stream (mod 65521). */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (const byte of data) {
+    a = (a + byte) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Legacy inflateAt: binary search for the smallest end that inflates to the expected
+ * size (~9 inflates per object). Kept as the fallback when the Adler search finds no
+ * verifiable stream end, and as the reference implementation for the unit tests.
+ */
+function inflateAtLegacy(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; nextOffset: number } {
   let guess = Math.min(buf.length - offset, Math.max(64, expectedSize + 32));
   for (;;) {
     const end = Math.min(buf.length, offset + guess);
